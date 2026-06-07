@@ -30,7 +30,7 @@ def step_sizes_from_positions(traj):
 def load_model(weights_path, device):
     transport = NeuralCorrection(hidden=64, layers=3).to(device)
     transport.load_state_dict(torch.load(weights_path, map_location=device))
-    model = NeuralODE(charge=-1.0, field_fn=None, transport=transport).to(device)
+    model = NeuralODE(transport).to(device)
     model.eval()
     return model
 

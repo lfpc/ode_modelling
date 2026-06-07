@@ -1,0 +1,352 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath, amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage[margin=1in]{geometry}
+\usepackage[hidelinks]{hyperref}
+\usepackage{caption}
+\usepackage{fancyhdr}
+
+\graphicspath{{outputs/plots/}}
+
+% --- running course header, like the course template ---------------------- %
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small Data Driven Modelling of Dynamical Systems}
+\rhead{\small \href{https://github.com/lfpc/ode_modelling}{\texttt{github.com/lfpc/ode\_modelling}}}
+\cfoot{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\newcommand{\dEdx}{\langle dE/dx\rangle}
+\newcommand{\unit}[1]{\,\mathrm{#1}}
+
+\title{\vspace{-2em}Modelling Muon Transport in Iron\\ with Neural ODEs and SDEs}
+\author{Luis Felipe Cattelan \\[2pt]
+        \small Physik-Institut, University of Z\"urich \\[1pt]
+        \small Course project --- Data Driven Modelling of Dynamical Systems}
+\date{\today}
+
+\begin{document}
+\maketitle
+\thispagestyle{fancy}
+
+\section{Introduction}
+When a charged particle crosses a block of matter it does not travel in a
+straight line at constant energy: it continuously loses momentum to the atomic
+electrons and is randomly deflected by the nuclei. Detector simulations such as
+Geant4 reproduce this in great detail, collision by collision, but at a high
+computational cost. The idea of this project is to ask whether a small neural
+network, trained on Geant4 output, can act as a fast \emph{surrogate} for one
+elementary process: the change in a muon's momentum after it travels a short
+step through iron. Practically, such a learned per-step map could replace the
+expensive Monte-Carlo stepping inside a simulation; more importantly, it is a clean test for a conceptual question about deterministic
+versus stochastic modelling.
+
+The model I want to learn is best stated by looking at the physics. A muon of
+momentum $p$ that travels an arc length ``$\mathrm{step}$'' through iron undergoes
+two things:
+\begin{itemize}
+  \item it \textbf{loses momentum along its direction of travel} ($dP_z<0$) by
+  ionizing the atomic electrons
+  \item it is \textbf{deflected sideways} ($dP_t$) by many small-angle Coulomb
+  scatters off the nuclei
+\end{itemize}
+The object to be learned is therefore the map
+$(p_0,\,\mathrm{step})\mapsto p_1$, the momentum after one step. The catch is that
+the data are stochastic -- every muon scatters differently -- while a
+deterministic network outputs only one value per input. Can such a model still
+learn the process ``in the mean'', and where does it break down?
+
+More formally, the muon's momentum along its path obeys an equation of motion of
+the form
+\begin{equation}
+  \frac{dp}{ds} \;=\;
+  \underbrace{q\,\hat{p}\times B}_{\text{Lorentz force (known)}}
+  \;+\;
+  \underbrace{f_\theta(p,\,\mathrm{step})}_{\text{material transport (to learn)}},
+  \label{eq:eom}
+\end{equation}
+where $\hat p=p/|p|$: the first term is the deflection by a magnetic field $B$ and
+the second is the change caused by the material (energy loss and scattering). The
+Lorentz term is known analytically and trivial to evaluate once the field is given, so the genuinely unknown, hard
+part is the material transport. The goal of this project is precisely to learn
+that transport term, $f_\theta$, from the Geant4 data.
+
+\section{The model}
+\subsection{Overview}
+I build two models that share the same neural backbone but differ in their output
+and training objective: a \emph{deterministic} Neural ODE that learns the mean
+transport rate $dp/ds$, and a \emph{stochastic} Neural SDE that learns a drift
+and a diffusion. Both are small multilayer perceptrons (three hidden layers,
+$64$ units, $\tanh$) implemented in PyTorch. Before describing them I recall the
+reference physics they are compared against.
+
+\subsection{Reference physics (the formulae we compare to)}
+\paragraph{Mean energy loss -- Bethe--Bloch \cite{pdg}.}
+\begin{equation}
+  -\left\langle\frac{dE}{dx}\right\rangle
+   = K z^2 \frac{Z}{A}\frac{1}{\beta^2}
+     \left[\tfrac12\ln\frac{2 m_e c^2\beta^2\gamma^2 W_{\max}}{I^2}
+           - \beta^2 - \frac{\delta(\beta\gamma)}{2}\right],
+  \label{eq:bb}
+\end{equation}
+with $K=0.307\unit{MeV\,cm^2/mol}$ and, for iron, $Z/A=0.466$,
+$\rho=7.87\unit{g/cm^3}$, $I=286\unit{eV}$; $W_{\max}$ is the maximum
+single-collision energy transfer and $\delta$ the Sternheimer density-effect
+correction. For a relativistic muon $dE\approx c\,dP_z$, so
+$\langle|dP_z|\rangle\propto\mathrm{step}$.
+
+\paragraph{Multiple scattering -- Highland \cite{highland}.}
+\begin{equation}
+  \theta_0 = \frac{13.6\unit{MeV}}{\beta c\,p}\,z\,\sqrt{x/X_0}
+             \left[1+0.038\ln\!\big(x z^2/(X_0\beta^2)\big)\right],
+  \label{eq:highland}
+\end{equation}
+with $X_0=1.76\unit{cm}$ for iron. The transverse momentum kick is
+$p_T\approx p\,\theta$, so $\mathrm{RMS}\,|p_T|=\sqrt2\,p\,\theta_0\propto\sqrt{x}$.
+
+\paragraph{Energy-loss fluctuations -- Landau/Vavilov \cite{landau}.}
+The energy loss in a thin layer is Landau-distributed (a sharp peak with a long
+tail from rare hard $\delta$-rays). Its variance (Bohr) is
+\begin{equation}
+  \sigma_E^2 = \tfrac{K}{2}\,\frac{Z}{A}\,\frac{z^2}{\beta^2}\,\rho x\,
+               W_{\max}\,\big(1-\tfrac{\beta^2}{2}\big).
+  \label{eq:vavilov}
+\end{equation}
+
+\subsection{Data and simulation setup}
+The data were produced with Geant4 \cite{geant4}, which transports muons through
+iron and stores, step by step along each trajectory, the momentum before and
+after the step; every row of the resulting table is one such single step. I work
+in a deliberately reduced setting: a single material (iron), no magnetic field
+(a field-free slab, so the only momentum changes come from the material) and no
+tracking of the spatial position -- only the momenta. Of the physics I keep
+ionization energy loss ($dP_z$) and multiple Coulomb scattering ($dP_t$);
+radiative losses (bremsstrahlung etc.) are $\lesssim$ a few percent at these
+energies and are not modelled separately.
+
+I take the muon to start along $z$, so the initial momentum is
+$p_0=[0,0,p_0]$ with $p_0\in[10,20]\unit{GeV}$, and after one step
+$p_1=[dP_t,\,0,\,p_0+dP_z]$: the longitudinal component shrinks by the energy
+loss and a transverse kick of magnitude $dP_t$ appears. The kick is placed along
+$x$ because its azimuth is physically uniform and carries no information; the
+random direction is restored at inference by an azimuthal rotation. Concretely we
+simulate millions of muons: for each one a step size is drawn, and Geant4 returns
+that (random) step together with the resulting $dP_z$ and $dP_t$.
+
+For training we feed the network the logarithm of the step size and normalize all
+inputs, which is necessary for numerical stability.
+
+%\begin{figure}[t]
+%  \centering
+%  \includegraphics[width=\linewidth]{data_overview.png}
+%  \caption{Exploratory analysis of the dataset. Top: step-size and momentum
+%  distributions, and the mean relative change vs.\ step (log--log) with reference
+%  slopes $1$ (Bethe--Bloch) and $\tfrac12$ (scattering). Bottom: the energy-loss
+%  rate and the scattering rate, normalized so that each is flat if the
+%  corresponding power law holds.}
+%  \label{fig:data}
+%\end{figure}
+
+\subsection{Deterministic Neural ODE}
+The motion over arc length $s$ obeys an equation of the form $dp/ds=f(p,s)$.
+Instead of hand-coding $f$ from Bethe--Bloch and scattering theory, a Neural ODE
+\cite{neuralode} \emph{learns} it: the rate is parametrized by the network,
+\begin{equation}
+  \frac{dp}{ds}=f_\theta(p,\,\mathrm{step}),
+  \label{eq:node}
+\end{equation}
+and the momentum after a finite step is obtained by a fourth-order Runge--Kutta
+(RK4) integration,
+\begin{align}
+  k_1 &= f_\theta(p_0,\,ds), \qquad
+  k_2 = f_\theta\!\big(p_0+\tfrac{ds}{2}k_1,\,ds\big), \notag\\
+  k_3 &= f_\theta\!\big(p_0+\tfrac{ds}{2}k_2,\,ds\big), \qquad
+  k_4 = f_\theta\!\big(p_0+ds\,k_3,\,ds\big), \notag\\
+  \hat p_1 &= p_0 + \tfrac{ds}{6}\big(k_1+2k_2+2k_3+k_4\big).
+  \label{eq:rk4}
+\end{align}
+Training is supervised on the single-step transitions $(p_0,\mathrm{step},p_1)$:
+for each sample we integrate one RK4 step and minimize the mean squared error of
+the \emph{relative} momentum change,
+\begin{equation}
+  \mathcal{L}_{\mathrm{MSE}}
+  = \Big\langle\, \big\|\,(\hat p_1-p_0)/|p_0| - (p_1-p_0)/|p_0|\,\big\|^2 \,\Big\rangle .
+  \label{eq:mse}
+\end{equation}
+Dividing by $|p_0|$ makes the target dimensionless and of order $10^{-3}$
+independent of the momentum. The key property is that the minimizer of an MSE
+loss is the \emph{conditional mean}: $f_\theta\to\mathbb{E}[dp\mid p_0,
+\mathrm{step}]$. The deterministic model therefore learns the mean energy loss
+and the mean transverse kick, but discards all fluctuation around them. At
+inference a trajectory is generated by chaining RK4 steps, with an optional
+random azimuthal rotation after each step to mimic the random scattering
+direction.
+
+\subsection{Stochastic Neural SDE}
+I model the same transport as an It\^o stochastic differential equation,
+\begin{equation}
+  dp = \mu_\theta(p,s)\,ds + \sigma_\theta(p,s)\,dW,\qquad dW\sim\mathcal N(0,ds\,\mathbb I),
+\end{equation}
+where the network outputs a drift $\mu$ and a (log-)diffusion $\sigma$. A single
+Euler--Maruyama step reads $\Delta p=\mu\,ds+\sigma\sqrt{ds}\,\xi$ with
+$\xi\sim\mathcal N(0,\mathbb I)$. The one-step transition is the diagonal Gaussian
+$p_1\mid p_0\sim\mathcal N(p_0+\mu\,ds,\ \mathrm{diag}(\sigma^2 ds))$, and I train
+by minimizing its negative log-likelihood (NLL). Unlike MSE, the NLL fits the
+mean \emph{and} the spread. Because scattering is isotropic but the data fix the
+kick along one axis, we apply a random azimuthal rotation to each $(p_0,p_1)$ pair
+during training; this forces the transverse drift to vanish and makes
+$\sigma_x=\sigma_y$, so the transverse spread is carried entirely by the
+diffusion term.
+
+\paragraph{Why an SDE is the natural object.} An ODE integrated by RK4 produces
+increments $\Delta p\propto ds$. Scattering requires $\Delta p_t\propto\sqrt{ds}$,
+i.e.\ a rate $dp_t/ds\propto1/\sqrt{ds}$ that diverges as $ds\to0$ -- impossible
+for a bounded network. The SDE puts the $\sqrt{ds}$ in the noise term, so the
+network only learns a smooth $\sigma$.
+
+\subsection{Training, tools and sources}
+Both models are trained on all $2\times10^6$ steps (a $90/10$ train/validation
+split) with Adam (learning rate $10^{-3}$), batches of $1024$, gradient-norm
+clipping at $1$, and a learning-rate-on-plateau schedule, for $10$--$15$ epochs;
+I keep the lowest-validation checkpoint. I found the weight decay had to be set
+to zero: at the usual $10^{-3}$ it is comparable to the signal itself (targets
+$\sim10^{-3}$) and simply drives the predictions toward zero. The code is written
+in Python with PyTorch \cite{pytorch} and is available at \url{https://github.com/lfpc/ode_modelling}; the analytic reference curves use the PDG
+parametrizations \cite{pdg, highland}. 
+
+\section{Analysis and validation}
+\subsection{Mean energy loss vs.\ Bethe--Bloch}
+Figure~\ref{fig:bb} compares the model's predicted mean $|dP_z|$ with the data
+and Bethe--Bloch. The Neural ODE overlays the data across all step sizes. The
+naive stopping power averaged over a step window sits $\sim25\%$ above the
+Bethe--Bloch value of $15.5\unit{MeV/cm}$ -- but, as explained next, this is an
+artifact of the data, not of the model: restricting to large, self-averaging
+steps removes it. In the window $1$--$5\unit{cm}$ (Fig.~\ref{fig:mom}) the data
+($15.47$), model ($15.25$) and theory ($15.48\unit{MeV/cm}$) agree at the percent
+level and show the same relativistic rise with momentum.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{bethe_bloch_comparison.png}
+  \caption{Energy loss vs.\ Bethe--Bloch. Left: mean $|dP_z|$ vs.\ step. Centre:
+  stopping power vs.\ step (the small-step blow-up is the selection bias of
+  Sec.~\ref{sec:bias}). Right: stopping power vs.\ momentum in a step window.
+  The NeuralODE (orange) tracks the data (blue) everywhere.}
+  \label{fig:bb}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.6\linewidth]{bethe_bloch_vs_momentum_largestep.png}
+  \caption{Stopping power vs.\ momentum, restricted to the self-averaging window
+  ($1$--$5\unit{cm}$): data, model and Bethe--Bloch agree to $\sim1\%$.}
+  \label{fig:mom}
+\end{figure}
+
+\subsection{The step-length selection bias}
+\label{sec:bias}
+The stopping power is a \emph{mean over many collisions}; a step recovers it only
+if it contains enough of them. For short steps the loss is Landau-distributed and
+dominated by whether a rare hard collision occurred. Moreover, Geant4 places step
+boundaries \emph{at} interaction points, so short steps are preferentially those
+containing a hard $\delta$-ray (biased high) while long steps are
+soft-collision-only stretches (biased low). Measuring the local
+$\langle|dP_z|\rangle/\mathrm{step}$ in narrow windows confirms this: it falls
+from $\sim500\unit{MeV/cm}$ at $0.1\unit{mm}$, through the Bethe--Bloch value at
+$1$--$3\unit{cm}$, down to $\sim9\unit{MeV/cm}$ at $10\unit{cm}$. The sub-linear
+fit $dP_z\propto\mathrm{step}^{0.62}$ is the fingerprint of this artifact, not of
+the physics. The model is faithful; the bias lives in the data, and it is removed
+by evaluating only where the data self-averages.
+
+\subsection{Scattering vs.\ Highland}
+The left panel of Fig.~\ref{fig:diff} compares the SDE's learned diffusion with
+the data RMS$|p_T|$ and Highland. In the self-averaging window the three agree
+closely: data $23.3$, model $22.8$, Highland $21.5\unit{MeV}$. The $\sim8\%$
+excess of the data over Highland is expected: Highland describes only the
+Gaussian core, whereas the RMS is sensitive to the non-Gaussian large-angle
+(Rutherford) tail. Removing the top $2\%$ of events (which carry $14.5\%$ of the
+variance) brings the data core to $21.5\unit{MeV}$, matching Highland exactly.
+
+\subsection{Energy-loss straggling vs.\ Vavilov}
+The right panel of Fig.~\ref{fig:diff} compares the SDE's $\sigma_z\sqrt{ds}$ with
+the data spread and Bohr/Vavilov, Eq.~\eqref{eq:vavilov}. The theory
+($70.5\unit{MeV}$) is within $\sim13\%$ of the data ($81.3\unit{MeV}$) with the
+correct $\sqrt{\mathrm{step}}$ slope, but the Gaussian SDE underestimates it
+($53.4\unit{MeV}$). This is the expected failure of a Gaussian to represent a
+heavy Landau tail: the likelihood-optimal Gaussian width is anchored to the bulk
+and cannot account for the rare catastrophic losses.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{sde_diffusion_comparison.png}
+  \caption{SDE diffusion vs.\ fluctuation theory. Left: transverse width vs.\
+  Highland (excellent agreement). Right: longitudinal width vs.\ Bohr/Vavilov;
+  the Gaussian SDE captures the scale but underestimates the heavy-tailed width.}
+  \label{fig:diff}
+\end{figure}
+
+
+\section{Discussion}
+This project started from a simple question -- can a deterministic network learn
+a stochastic physical process ``in the mean'' -- and ended up being a clean
+demonstration of the difference between drift and diffusion. The most satisfying
+result is that, after fixing two non-obvious issues (the input normalization, and
+restricting the comparison to self-averaging steps), the learned energy loss lands
+essentially on top of the data from Geant4. 
+
+The two main difficulties were as instructive as the successes. First, the
+\emph{step-length selection bias} in the Geant4 data: I initially read the
+$\sim25\%$ excess in the stopping power as a model error, and only understood it
+after measuring the local $dE/dx$ as a function of step and realizing that short
+steps in Geant4 are statistically special. A cleaner dataset (fixed step length,
+or the continuous loss reported separately from $\delta$-rays) would avoid this
+entirely. Second, the \emph{Gaussian-versus-Landau} limitation: the SDE captures
+the variance of each channel but not the skew of the energy-loss distribution nor
+the power-law scattering tail. A natural next step would be a heavy-tailed noise
+(for example modelling $\log dP_z$, or using a Student-$t$ or normalizing-flow
+noise), which I expect would close the remaining gap in the straggling.
+
+A more principled framework, and the one I would adopt if I continued this work,
+is the \emph{Neural Jump Stochastic Differential Equation} of Jia and Benson
+\cite{njsde}. There the state evolves by a continuous neural flow (a drift, and
+optionally a diffusion) but is also subject to discrete \emph{jumps} that occur at
+random times drawn from a learned point process, each jump applying a learned
+(stochastic) increment to the state. This matches the physics almost exactly: the
+continuous flow is the soft, frequent collisions -- the smooth $dE/dx$ and the
+Gaussian core of the scattering that my models already capture -- while the
+\emph{jumps} are precisely the rare hard events I miss, namely the energetic
+$\delta$-rays that build the Landau tail of the energy loss and the large-angle
+Rutherford scatters that build the non-Gaussian tail of the deflection. Splitting
+the dynamics into a smooth part and a jump part this way, rather than forcing a
+single Gaussian to absorb both, is the natural way to reproduce the heavy tails
+that are the one ingredient missing from the present model.
+
+In summary, the mean energy loss is learned essentially exactly; the scattering
+width is captured well by the Gaussian SDE; and only the heavy tail of the
+energy-loss fluctuations is genuinely missed.
+
+\begin{thebibliography}{9}
+\bibitem{pdg} Particle Data Group, R.~L.~Workman \emph{et al.},
+  ``Review of Particle Physics'' ,
+  \emph{Prog. Theor. Exp. Phys.} (2022).
+\bibitem{highland} V.~L.~Highland, ``Some practical remarks on multiple
+  scattering,'' \emph{Nucl. Instrum. Meth.} \textbf{129}, 497 (1975);
+  G.~R.~Lynch and O.~I.~Dahl, \emph{Nucl. Instrum. Meth.} \textbf{B58}, 6 (1991).
+\bibitem{landau} L.~D.~Landau, ``On the energy loss of fast particles by
+  ionization,'' \emph{J. Phys. USSR} \textbf{8}, 201 (1944).
+\bibitem{geant4} S.~Agostinelli \emph{et al.},
+  ``Geant4 -- a simulation toolkit,'' \emph{Nucl. Instrum. Meth.} \textbf{A506},
+  250 (2003).
+\bibitem{neuralode} R.~T.~Q.~Chen, Y.~Rubanova, J.~Bettencourt and D.~Duvenaud,
+  ``Neural Ordinary Differential Equations,'' \emph{NeurIPS} (2018).
+\bibitem{njsde} J.~Jia and A.~R.~Benson, ``Neural Jump Stochastic Differential
+  Equations,'' \emph{NeurIPS} (2019).
+\bibitem{pytorch} A.~Paszke \emph{et al.}, ``PyTorch: An Imperative Style,
+  High-Performance Deep Learning Library,'' \emph{NeurIPS} (2019).
+\end{thebibliography}
+
+\end{document}
